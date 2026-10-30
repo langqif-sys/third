@@ -1,0 +1,21 @@
+# Dataset (Exclude large CSV files)
+dataest/
+dataset/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints, logs, and results
+checkpoints/
+results/
+logs/
+*.log
+
+# Windows & OS metadata
+*:Zone.Identifier
+*Zone.Identifier*
+.DS_Store
+.vscode/
+.idea/
