@@ -5,6 +5,8 @@ from exp.exp_main import Exp_Main
 import random
 import numpy as np
 import multiprocessing
+import hashlib
+import json
 
 parser = argparse.ArgumentParser(description='Model family for Time Series Forecasting')
 
@@ -15,7 +17,7 @@ parser.add_argument('--random_seed', type=int, default=2024, help='random seed')
 parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
 parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
 parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                    help='model name, options: [Autoformer, DLinear, PatchTST]')
+                    help='model name: TimeEmb, TimeEmb_FRCA, Autoformer, DLinear, PatchTST')
 
 # data loader
 parser.add_argument('--data', type=str, required=True, default='ETTh1', help='dataset type')
@@ -39,6 +41,23 @@ parser.add_argument('--use_hour_index', type=int, default=1, help='1: use hour_i
 parser.add_argument('--use_day_index', type=int, default=0, help='1: use day_index or 0: no use')
 parser.add_argument('--hour_length', type=int, default=24, help='embedding length of hour index')
 parser.add_argument('--day_length', type=int, default=7, help='embedding length of day index')
+
+# One-layer temporal correction branch; independent of TimeEmb's MLP width.
+parser.add_argument('--frca_mode', choices=['complement', 'plain', 'residual'], default='complement')
+parser.add_argument('--frca_dim', type=int, default=64)
+parser.add_argument('--frca_heads', type=int, default=4)
+parser.add_argument('--frca_patch_len', type=int, default=16)
+parser.add_argument('--frca_stride', type=int, default=8)
+parser.add_argument('--frca_dropout', type=float, default=0.1)
+parser.add_argument('--frca_beta_init', type=float, default=0.1)
+parser.add_argument('--frca_beta_fixed', type=float, default=-1.0, help='-1: learn beta; [0,1]: fixed ablation')
+parser.add_argument('--frca_eta_init', type=float, default=0.01)
+parser.add_argument('--frca_detach_reference', type=int, choices=[0, 1], default=1)
+parser.add_argument('--frca_reference', choices=['timeemb', 'moving_average'], default='timeemb')
+parser.add_argument('--frca_ma_kernel', type=int, default=25)
+parser.add_argument('--frca_inverted', type=int, choices=[0, 1], default=1)
+parser.add_argument('--max_train_batches', type=int, default=0, help='0: full epoch; >0: smoke test only')
+parser.add_argument('--max_eval_batches', type=int, default=0, help='0: full validation/test; >0: smoke test only')
 # Optimization Objective
 parser.add_argument('--rec_lambda', type=float, default=0., help='weight of reconstruction function')
 parser.add_argument('--auxi_lambda', type=float, default=1, help='weight of auxilary function')
@@ -108,13 +127,29 @@ parser.add_argument('--pct_start', type=float, default=0.3, help='pct_start')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
 # GPU
-parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
+parser.add_argument('--use_gpu', type=int, choices=[0, 1], default=1, help='1: GPU if available, 0: CPU')
 parser.add_argument('--gpu', type=int, default=0, help='gpu')
 parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
 parser.add_argument('--devices', type=str, default='0,1', help='device ids of multile gpus')
 parser.add_argument('--test_flop', action='store_true', default=False, help='See utils/tools for usage')
 
 args = parser.parse_args()
+if args.max_train_batches < 0 or args.max_eval_batches < 0:
+    parser.error('max_*_batches must be nonnegative')
+if args.max_train_batches or args.max_eval_batches:
+    print('SMOKE TEST: batch limits are enabled; metrics are not benchmark results.')
+
+
+def experiment_suffix(args):
+    # Include all architecture/training/data settings; avoid overwriting ablations.
+    config = vars(args).copy()
+    for key in ('is_training', 'do_predict', 'num_workers', 'itr', 'use_gpu', 'gpu',
+                'use_multi_gpu', 'devices', 'device_ids'):
+        config.pop(key, None)
+    if args.model != 'TimeEmb_FRCA':
+        config = {k: v for k, v in config.items() if not k.startswith('frca_')}
+    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:10]
+    return '_seed{}_{}'.format(args.random_seed, digest)
 
 # random seed
 fix_seed = args.random_seed
@@ -160,6 +195,7 @@ if __name__ == '__main__':
                 ii
             )
 
+            setting += experiment_suffix(args)
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
@@ -194,6 +230,7 @@ if __name__ == '__main__':
             ii
         )
 
+        setting += experiment_suffix(args)
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)

@@ -1,5 +1,7 @@
 # TimeEmb
 
+此工作副本新增了 TimeEmb_FRCA，使用说明见 [README_FRCA.md](README_FRCA.md)。下方保留原 TimeEmb 说明。
+
 ## Getting Started
 
 ### 1、Environment Requirements

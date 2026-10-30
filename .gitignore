@@ -19,3 +19,8 @@ logs/
 .DS_Store
 .vscode/
 .idea/
+
+# Version 2: local validation outputs
+.pytest_cache/
+test_results/
+result.txt

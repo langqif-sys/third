@@ -1,5 +1,6 @@
 from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_Pred, Dataset_Solar, Dataset_PEMS, Dataset_Weather
 from torch.utils.data import DataLoader
+from torch import Generator
 
 data_dict = {
     'ETTh1': Dataset_ETT_hour,
@@ -17,7 +18,7 @@ def data_provider(args, flag):
     Data = data_dict[args.data]
     timeenc = 0 if args.embed != 'timeF' else 1
 
-    if flag == 'test':
+    if flag in {'test', 'val'}:
         shuffle_flag = False
         drop_last = False
         batch_size = args.batch_size
@@ -50,5 +51,7 @@ def data_provider(args, flag):
         batch_size=batch_size,
         shuffle=shuffle_flag,
         num_workers=args.num_workers,
-        drop_last=drop_last)
+        drop_last=drop_last,
+        # Separate data order from random numbers consumed by model initialization.
+        generator=Generator().manual_seed(args.random_seed))
     return data_set, data_loader

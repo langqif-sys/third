@@ -1,10 +1,11 @@
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from models import Autoformer, DLinear, PatchTST, TimeEmb
+from models import Autoformer, DLinear, PatchTST, TimeEmb, TimeEmb_FRCA
 from utils.polynomial import (chebyshev_torch, hermite_torch, laguerre_torch,
                               leg_torch)
 from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from utils.metrics import metric
+from utils.forecast_loss import forecast_loss
 
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ from torch.optim import lr_scheduler
 
 import os
 import time
+import json
 
 import warnings
 import matplotlib.pyplot as plt
@@ -46,6 +48,7 @@ class Exp_Main(Exp_Basic):
             'DLinear': DLinear,
             'PatchTST': PatchTST,
             'TimeEmb': TimeEmb,
+            'TimeEmb_FRCA': TimeEmb_FRCA,
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
@@ -70,6 +73,8 @@ class Exp_Main(Exp_Basic):
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, hour_index, day_index) in enumerate(vali_loader):
+                if self.args.max_eval_batches and i >= self.args.max_eval_batches:
+                    break
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float()
 
@@ -129,10 +134,17 @@ class Exp_Main(Exp_Basic):
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
             os.makedirs(path)
+        with open(os.path.join(path, 'config.json'), 'w', encoding='utf-8') as config_file:
+            json.dump(vars(self.args), config_file, indent=2, ensure_ascii=False)
 
         time_now = time.time()
 
         train_steps = len(train_loader)
+        if self.args.max_train_batches:
+            train_steps = min(train_steps, self.args.max_train_batches)
+        if train_steps < 1:
+            raise ValueError('Empty training loader; reduce batch_size or check dataset length')
+        mechanism_history = []
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
@@ -155,6 +167,8 @@ class Exp_Main(Exp_Basic):
             epoch_time = time.time()
             # max_memory = 0
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, hour_index, day_index) in enumerate(train_loader):
+                if self.args.max_train_batches and i >= self.args.max_train_batches:
+                    break
                 iter_count += 1
                 model_optim.zero_grad()
                 batch_x = batch_x.float().to(self.device)
@@ -188,7 +202,7 @@ class Exp_Main(Exp_Basic):
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
+                        loss = forecast_loss(outputs, batch_y, self.args, self.mask)
                         train_loss.append(loss.item())
                 else:
                     if any(substr in self.args.model for substr in {'TimeEmb'}):
@@ -206,80 +220,8 @@ class Exp_Main(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                    loss = 0
-                    if self.args.rec_lambda:
-                        loss_rec = criterion(outputs, batch_y)
-
-                        loss += self.args.rec_lambda * loss_rec
-                        if (i + 1) % 100 == 0:
-                            print(f"\tloss_rec: {loss_rec.item()}")
-
-
-                    if self.args.auxi_lambda:
-                        # fft shape: [B, P, D]
-                        if self.args.auxi_mode == "fft":
-                            loss_auxi = torch.fft.fft(outputs, dim=1) - torch.fft.fft(batch_y, dim=1)
-
-                        elif self.args.auxi_mode == "rfft":
-                            if self.args.auxi_type == 'complex':
-                                loss_auxi = torch.fft.rfft(outputs, dim=1) - torch.fft.rfft(batch_y, dim=1)
-                            elif self.args.auxi_type == 'complex-phase':
-                                loss_auxi = (torch.fft.rfft(outputs, dim=1) - torch.fft.rfft(batch_y, dim=1)).angle()
-                            elif self.args.auxi_type == 'complex-mag-phase':
-                                loss_auxi_mag = (torch.fft.rfft(outputs, dim=1) - torch.fft.rfft(batch_y, dim=1)).abs()
-                                loss_auxi_phase = (torch.fft.rfft(outputs, dim=1) - torch.fft.rfft(batch_y, dim=1)).angle()
-                                loss_auxi = torch.stack([loss_auxi_mag, loss_auxi_phase])
-                            elif self.args.auxi_type == 'phase':
-                                loss_auxi = torch.fft.rfft(outputs, dim=1).angle() - torch.fft.rfft(batch_y, dim=1).angle()
-                            elif self.args.auxi_type == 'mag':
-                                loss_auxi = torch.fft.rfft(outputs, dim=1).abs() - torch.fft.rfft(batch_y, dim=1).abs()
-                            elif self.args.auxi_type == 'mag-phase':
-                                loss_auxi_mag = torch.fft.rfft(outputs, dim=1).abs() - torch.fft.rfft(batch_y, dim=1).abs()
-                                loss_auxi_phase = torch.fft.rfft(outputs, dim=1).angle() - torch.fft.rfft(batch_y, dim=1).angle()
-                                loss_auxi = torch.stack([loss_auxi_mag, loss_auxi_phase])
-                            else:
-                                raise NotImplementedError
-
-                        elif self.args.auxi_mode == "rfft-D":
-                            loss_auxi = torch.fft.rfft(outputs, dim=-1) - torch.fft.rfft(batch_y, dim=-1)
-
-                        elif self.args.auxi_mode == "rfft-2D":
-                            loss_auxi = torch.fft.rfft2(outputs) - torch.fft.rfft2(batch_y)
-
-                        elif self.args.auxi_mode == "legendre":
-                            loss_auxi = leg_torch(outputs, self.args.leg_degree, device=self.device) - leg_torch(batch_y, self.args.leg_degree, device=self.device)
-
-                        elif self.args.auxi_mode == "chebyshev":
-                            loss_auxi = chebyshev_torch(outputs, self.args.leg_degree, device=self.device) - chebyshev_torch(batch_y, self.args.leg_degree, device=self.device)
-
-                        elif self.args.auxi_mode == "hermite":
-                            loss_auxi = hermite_torch(outputs, self.args.leg_degree, device=self.device) - hermite_torch(batch_y, self.args.leg_degree, device=self.device)
-
-                        elif self.args.auxi_mode == "laguerre":
-                            loss_auxi = laguerre_torch(outputs, self.args.leg_degree, device=self.device) - laguerre_torch(batch_y, self.args.leg_degree, device=self.device)
-                        else:
-                            raise NotImplementedError
-
-                        if self.mask is not None:
-                            loss_auxi *= self.mask
-
-                        if self.args.auxi_loss == "MAE":
-                            loss_auxi = loss_auxi.abs().mean() if self.args.module_first else loss_auxi.mean().abs()  # check the dim of fft
-                        elif self.args.auxi_loss == "MSE":
-                            loss_auxi = (loss_auxi.abs()**2).mean() if self.args.module_first else (loss_auxi**2).mean().abs()
-                        else:
-                            raise NotImplementedError
-
-                        loss += self.args.auxi_lambda * loss_auxi
-                        if (i + 1) % 100 == 0:
-                            print(f"\tloss_auxi: {loss_auxi.item()}")
-
-
+                    loss = forecast_loss(outputs, batch_y, self.args, self.mask)
                     train_loss.append(loss.item())
-
-
-                    #loss = criterion(outputs, batch_y)
-                    #train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -312,6 +254,12 @@ class Exp_Main(Exp_Basic):
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
+            base_model = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(base_model, 'mechanism_state'):
+                mechanism_history.append({'epoch': epoch + 1, **base_model.mechanism_state()})
+                print('FRCA beta:', mechanism_history[-1]['beta'])
+                with open(os.path.join(path, 'mechanism_history.json'), 'w', encoding='utf-8') as history_file:
+                    json.dump(mechanism_history, history_file, indent=2)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
@@ -322,7 +270,11 @@ class Exp_Main(Exp_Basic):
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
         best_model_path = path + '/' + 'checkpoint.pth'
-        self.model.load_state_dict(torch.load(best_model_path))
+        self.model.load_state_dict(torch.load(best_model_path, map_location=self.device, weights_only=True))
+        base_model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(base_model, 'mechanism_state'):
+            with open(os.path.join(path, 'mechanism_best.json'), 'w', encoding='utf-8') as state_file:
+                json.dump(base_model.mechanism_state(), state_file, indent=2)
 
         # print(f"Max Memory (MB): {max_memory}")
 
@@ -333,7 +285,8 @@ class Exp_Main(Exp_Basic):
 
         if test:
             print('loading model')
-            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+            self.model.load_state_dict(torch.load(os.path.join(self.args.checkpoints, setting, 'checkpoint.pth'),
+                                                 map_location=self.device, weights_only=True))
 
         preds = []
         trues = []
@@ -345,6 +298,8 @@ class Exp_Main(Exp_Basic):
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, hour_index, day_index) in enumerate(test_loader):
+                if self.args.max_eval_batches and i >= self.args.max_eval_batches:
+                    break
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
@@ -422,6 +377,10 @@ class Exp_Main(Exp_Basic):
 
         mae, mse, rmse, mape, mspe, rse, corr = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
+        with open(os.path.join(folder_path, 'metrics.json'), 'w', encoding='utf-8') as metrics_file:
+            json.dump({'mse': float(mse), 'mae': float(mae),
+                       'smoke_test': bool(self.args.max_train_batches or self.args.max_eval_batches)},
+                      metrics_file, indent=2)
         f = open("result.txt", 'a')
         f.write(setting + "  \n")
         f.write('mse:{}, mae:{}'.format(mse, mae))
@@ -441,7 +400,7 @@ class Exp_Main(Exp_Basic):
         if load:
             path = os.path.join(self.args.checkpoints, setting)
             best_model_path = path + '/' + 'checkpoint.pth'
-            self.model.load_state_dict(torch.load(best_model_path))
+            self.model.load_state_dict(torch.load(best_model_path, map_location=self.device, weights_only=True))
 
         preds = []
 
