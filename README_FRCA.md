@@ -85,7 +85,7 @@ z = z + FFN(LayerNorm(z))
 在你原来的 WSL 项目目录中运行：
 
 ```bash
-cd '/home/f1348224707/code/TimeEmb-main (origin)'
+cd '/home/f1348224707/code/mine(1.0)'
 # 激活你原来运行 TimeEmb 的环境，再按需安装依赖：
 python -m pip install -r requirements.txt
 ```
